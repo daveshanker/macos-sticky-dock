@@ -1,5 +1,6 @@
 import AppKit
 import CoreGraphics
+import os
 
 /// Prevents the Dock from migrating to non-preferred displays by intercepting
 /// mouse events via a CGEventTap.
@@ -22,15 +23,25 @@ import CoreGraphics
 /// # Threading
 ///
 /// The event tap callback runs on a dedicated background thread (its own
-/// CFRunLoop). All mutable state accessed from the callback uses `os_unfair_lock`
-/// for thread safety. The lock is held for nanoseconds (just reading a few
-/// scalars), so there is no perceptible input latency.
+/// CFRunLoop). All mutable state accessed from the callback is protected by
+/// an `OSAllocatedUnfairLock`. The lock is held for nanoseconds (just reading
+/// a few scalars), so there is no perceptible input latency.
 ///
-final class DockGuard {
+/// # Security note
+///
+/// The event tap is installed at `.cghidEventTap` (HID level), which is the
+/// most privileged tap point. This is required to modify events before
+/// WindowServer processes them. The event mask is restricted to `.mouseMoved`
+/// only — no other event types are intercepted or modified.
+///
+final class DockGuard: @unchecked Sendable {
 
     // MARK: - Public State
 
-    var isRunning: Bool { eventTap != nil }
+    /// Whether the event tap is currently installed and running.
+    var isRunning: Bool {
+        lock.withLock { _eventTap != nil }
+    }
 
     /// Callback fired on the main thread when the event tap is disabled by
     /// the system (usually because Accessibility permission was revoked).
@@ -38,22 +49,35 @@ final class DockGuard {
 
     // MARK: - Private State
 
-    private var eventTap: CFMachPort?
-    private var runLoopSource: CFRunLoopSource?
-    private var guardRunLoop: CFRunLoop?
+    /// Lock protecting ALL mutable state accessed from both the main thread
+    /// and the event tap callback thread. This includes the event tap handle,
+    /// run loop references, and the guarded configuration fields.
+    private let lock = OSAllocatedUnfairLock()
 
-    /// Lock protecting all `_guarded*` fields accessed from the event callback.
-    private var lock = os_unfair_lock()
+    /// Event tap handle. Protected by `lock`.
+    private var _eventTap: CFMachPort?
 
-    /// The display ID the user wants the Dock locked to.
+    /// Run loop source for the event tap. Protected by `lock`.
+    private var _runLoopSource: CFRunLoopSource?
+
+    /// The background thread's run loop. Protected by `lock`.
+    private var _guardRunLoop: CFRunLoop?
+
+    /// Signaled when the background thread has fully exited.
+    private let threadExitSemaphore = DispatchSemaphore(value: 0)
+
+    /// The display ID the user wants the Dock locked to. Protected by `lock`.
     private var _guardedPreferredDisplayID: CGDirectDisplayID = 0
 
-    /// Whether guarding is enabled (user can toggle via menu).
+    /// Whether guarding is enabled (user can toggle via menu). Protected by `lock`.
     private var _guardedEnabled: Bool = true
 
-    /// Cached bounds of all connected displays, keyed by display ID.
-    /// Updated on the main thread when displays change; read from the callback.
+    /// Cached bounds of all connected displays. Protected by `lock`.
     private var _guardedDisplayBounds: [(id: CGDirectDisplayID, bounds: CGRect)] = []
+
+    /// Retained self-reference that keeps this instance alive while the event
+    /// tap callback holds a raw pointer to us. Set in `start()`, cleared in `stop()`.
+    private var _retainedSelf: Unmanaged<DockGuard>?
 
     /// How close (in points) to the bottom edge the cursor must be before we
     /// intervene. macOS triggers Dock migration at ~1-2px from the edge.
@@ -72,11 +96,20 @@ final class DockGuard {
     // MARK: - Start / Stop
 
     func start(preferredDisplayID: CGDirectDisplayID, displays: [DisplayInfo]) {
-        guard eventTap == nil else { return }
+        lock.lock()
+        guard _eventTap == nil else {
+            lock.unlock()
+            return
+        }
+        lock.unlock()
 
         // Seed the guarded state before installing the tap.
         updatePreferredDisplay(preferredDisplayID)
         updateDisplayBounds(displays)
+
+        // Retain self so the raw pointer in the callback stays valid.
+        // Released in stop() after the background thread has exited.
+        _retainedSelf = Unmanaged.passRetained(self)
 
         // We want to intercept mouseMoved events globally.
         let eventMask: CGEventMask = (1 << CGEventType.mouseMoved.rawValue)
@@ -84,71 +117,97 @@ final class DockGuard {
         guard let tap = CGEvent.tapCreate(
             tap: .cghidEventTap,
             place: .headInsertEventTap,
-            options: .defaultTap,           // Allows modifying/blocking events
+            options: .defaultTap,
             eventsOfInterest: eventMask,
             callback: dockGuardEventCallback,
             userInfo: Unmanaged.passUnretained(self).toOpaque()
         ) else {
-            // Most likely: Accessibility permission not granted.
+            // Accessibility permission not granted. Release the retain.
+            _retainedSelf?.release()
+            _retainedSelf = nil
             return
         }
 
-        eventTap = tap
-
         let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
-        runLoopSource = source
+
+        lock.withLock {
+            _eventTap = tap
+            _runLoopSource = source
+        }
 
         // Run the event tap on a dedicated thread so we never block the main
         // thread's run loop with event processing.
+        let semaphore = threadExitSemaphore
         let thread = Thread { [weak self] in
-            guard let source else { return }
+            guard let self, let source else {
+                semaphore.signal()
+                return
+            }
             let rl = CFRunLoopGetCurrent()!
-            self?.guardRunLoop = rl
+            self.lock.withLock { self._guardRunLoop = rl }
             CFRunLoopAddSource(rl, source, .commonModes)
             CFRunLoopRun()
+            // Run loop has exited — signal that we're done.
+            semaphore.signal()
         }
         thread.name = "com.dockanchor.EventTap"
         thread.qualityOfService = .userInteractive
         thread.start()
     }
 
+    /// Stops the event tap and synchronously waits for the background thread
+    /// to exit before returning. Safe to call from the main thread.
     func stop() {
-        if let tap = eventTap {
-            CGEvent.tapEnable(tap: tap, enable: false)
+        let (tap, source, rl) = lock.withLock { () -> (CFMachPort?, CFRunLoopSource?, CFRunLoop?) in
+            let t = _eventTap
+            let s = _runLoopSource
+            let r = _guardRunLoop
+            _eventTap = nil
+            _runLoopSource = nil
+            _guardRunLoop = nil
+            return (t, s, r)
         }
-        if let rl = guardRunLoop {
-            CFRunLoopStop(rl)
-        }
-        if let source = runLoopSource, let rl = guardRunLoop {
+
+        guard tap != nil else { return }
+
+        // Disable the tap so no more callbacks fire.
+        if let tap { CGEvent.tapEnable(tap: tap, enable: false) }
+
+        // Stop the run loop so the background thread can exit.
+        if let rl { CFRunLoopStop(rl) }
+
+        // Wait for the background thread to fully exit before we release
+        // the retained self-reference. This prevents use-after-free.
+        threadExitSemaphore.wait()
+
+        if let source, let rl {
             CFRunLoopRemoveSource(rl, source, .commonModes)
         }
-        eventTap = nil
-        runLoopSource = nil
-        guardRunLoop = nil
+
+        // Release the retain cycle now that the callback can no longer fire.
+        _retainedSelf?.release()
+        _retainedSelf = nil
     }
 
     // MARK: - State Updates (called from main thread)
 
     func updatePreferredDisplay(_ displayID: CGDirectDisplayID) {
-        os_unfair_lock_lock(&lock)
-        _guardedPreferredDisplayID = displayID
-        os_unfair_lock_unlock(&lock)
+        lock.withLock { _guardedPreferredDisplayID = displayID }
     }
 
     func updateDisplayBounds(_ displays: [DisplayInfo]) {
         let bounds = displays.map { (id: $0.id, bounds: CGDisplayBounds($0.id)) }
-        os_unfair_lock_lock(&lock)
-        _guardedDisplayBounds = bounds
-        os_unfair_lock_unlock(&lock)
+        lock.withLock { _guardedDisplayBounds = bounds }
     }
 
     func setEnabled(_ enabled: Bool) {
-        os_unfair_lock_lock(&lock)
-        _guardedEnabled = enabled
-        os_unfair_lock_unlock(&lock)
+        let tap: CFMachPort? = lock.withLock {
+            _guardedEnabled = enabled
+            return _eventTap
+        }
 
-        // Also enable/disable the tap itself to avoid unnecessary overhead.
-        if let tap = eventTap {
+        // Enable/disable the tap itself to avoid unnecessary callback overhead.
+        if let tap {
             CGEvent.tapEnable(tap: tap, enable: enabled)
         }
     }
@@ -156,13 +215,11 @@ final class DockGuard {
     // MARK: - Event Callback Logic
 
     /// Called from the event tap callback (background thread).
-    /// Returns the (possibly modified) event, or nil to suppress it.
+    /// Returns the (possibly modified) event.
     fileprivate func handleMouseMoved(_ event: CGEvent) -> CGEvent {
-        os_unfair_lock_lock(&lock)
-        let enabled = _guardedEnabled
-        let preferredID = _guardedPreferredDisplayID
-        let displays = _guardedDisplayBounds
-        os_unfair_lock_unlock(&lock)
+        let (enabled, preferredID, displays) = lock.withLock {
+            (_guardedEnabled, _guardedPreferredDisplayID, _guardedDisplayBounds)
+        }
 
         guard enabled, preferredID != 0, displays.count > 1 else {
             return event
@@ -205,9 +262,10 @@ final class DockGuard {
     /// Called when the system disables our event tap (e.g., Accessibility
     /// permission revoked). We re-enable it after a delay, and notify the UI.
     fileprivate func handleTapDisabled() {
-        // Try to re-enable after a short delay.
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-            guard let self, let tap = self.eventTap else { return }
+            guard let self else { return }
+            let tap = self.lock.withLock { self._eventTap }
+            guard let tap else { return }
             if DockGuard.checkAccessibility() {
                 CGEvent.tapEnable(tap: tap, enable: true)
             } else {
@@ -239,7 +297,6 @@ private func dockGuardEventCallback(
         return Unmanaged.passUnretained(result)
 
     case .tapDisabledByUserInput, .tapDisabledByTimeout:
-        // The system disabled our tap — try to recover.
         guard_.handleTapDisabled()
         return Unmanaged.passUnretained(event)
 

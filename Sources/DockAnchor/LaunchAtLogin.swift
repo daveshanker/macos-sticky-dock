@@ -1,9 +1,12 @@
 import Foundation
+import os
 import ServiceManagement
 
 /// Manages registering and unregistering the app as a login item using SMAppService.
 @MainActor
 final class LaunchAtLoginManager {
+
+    private static let logger = Logger(subsystem: "com.dockanchor", category: "LaunchAtLogin")
 
     // MARK: - Properties
 
@@ -20,7 +23,7 @@ final class LaunchAtLoginManager {
                     try SMAppService.mainApp.unregister()
                 }
             } catch {
-                print("LaunchAtLogin: Failed to \(newValue ? "enable" : "disable"): \(error)")
+                Self.logger.error("Failed to \(newValue ? "enable" : "disable") login item: \(error.localizedDescription, privacy: .public)")
             }
         }
     }
