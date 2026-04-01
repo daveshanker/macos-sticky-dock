@@ -35,6 +35,7 @@ protocol DisplayProviding: AnyObject {
 // MARK: - PreferencesPersisting
 
 /// Read/write home display preference and other settings.
+@MainActor
 protocol PreferencesPersisting: AnyObject {
     var preferredDisplayID: CGDirectDisplayID? { get set }
     var launchAtLogin: Bool { get set }

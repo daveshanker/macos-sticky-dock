@@ -154,7 +154,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 
     @objc private func showAbout(_ sender: NSMenuItem) {
         // Bring the app to front so the about panel is visible.
-        NSApplication.shared.activate(ignoringOtherApps: true)
+        NSApplication.shared.activate()
 
         let options: [NSApplication.AboutPanelOptionKey: Any] = [
             .applicationName: "DockAnchor",

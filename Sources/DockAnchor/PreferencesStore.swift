@@ -2,6 +2,7 @@ import CoreGraphics
 import Foundation
 
 /// Persists user preferences using UserDefaults.
+@MainActor
 final class PreferencesStore: PreferencesPersisting {
 
     // MARK: - Keys
