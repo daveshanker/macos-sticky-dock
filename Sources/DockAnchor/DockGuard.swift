@@ -9,10 +9,15 @@ import os
 ///
 /// macOS migrates the Dock to a new screen when the cursor dwells at the very
 /// bottom edge (within ~2px) of that screen for approximately 0.5–1 second.
-/// DockGuard installs a CGEventTap that intercepts `.mouseMoved` events and,
-/// when it detects the cursor approaching the bottom edge of a non-preferred
-/// display, nudges the cursor up by a few pixels. The WindowServer never sees
-/// the sustained bottom-edge dwell, so the Dock never migrates.
+/// DockGuard installs a CGEventTap that intercepts `.mouseMoved` events and
+/// tracks how long the cursor sits at the bottom edge of non-preferred displays.
+///
+/// - For the first 300ms, events pass through unmodified. This allows the
+///   cursor to traverse screen edges normally (reaching other monitors,
+///   Universal Control handoff, etc.).
+/// - After 300ms of sustained dwell at the edge, DockGuard nudges the cursor
+///   up by a few pixels. The WindowServer never sees a long enough dwell to
+///   trigger Dock migration.
 ///
 /// # Permissions
 ///
@@ -37,11 +42,12 @@ import os
 /// WindowServer processes them. The event mask is restricted to `.mouseMoved`
 /// only — no other event types are intercepted or modified.
 ///
-/// # Known limitation
+/// # Compatibility
 ///
-/// The bottom 3 pixels of non-preferred displays are unreachable while
-/// guarding is active. This is the minimum zone needed to reliably prevent
-/// Dock migration (macOS triggers at ~1-2px).
+/// The dwell-based approach is compatible with multi-monitor setups where
+/// the cursor must pass through a screen's bottom edge to reach another
+/// display, and with Universal Control / Barrier / Synergy where the
+/// cursor crosses a screen edge to reach another machine.
 ///
 final class DockGuard: @unchecked Sendable {
 
@@ -90,11 +96,25 @@ final class DockGuard: @unchecked Sendable {
     /// tap callback holds a raw pointer to us. Protected by `lock`.
     private var _retainedSelf: Unmanaged<DockGuard>?
 
-    /// How close (in points) to the bottom edge the cursor must be before we
-    /// intervene. macOS triggers Dock migration at ~1-2px from the edge.
-    /// We use a 2px zone — the minimum needed to reliably block migration
-    /// while keeping nearly all screen area reachable.
-    private let edgeThreshold: CGFloat = 2
+    // -- Dwell tracking (protected by `lock`) --
+
+    /// Timestamp (CFAbsoluteTime) when the cursor first entered the bottom
+    /// edge zone on a non-preferred display. 0 means not dwelling.
+    private var _dwellStartTime: CFAbsoluteTime = 0
+
+    /// Which display the cursor was dwelling on (to detect display changes).
+    private var _dwellDisplayID: CGDirectDisplayID = 0
+
+    /// How close (in points) to the bottom edge counts as the "danger zone"
+    /// where Dock migration can trigger. macOS triggers at ~1-2px.
+    private let edgeThreshold: CGFloat = 4
+
+    /// How long (in seconds) the cursor can sit at the bottom edge before
+    /// we start nudging. macOS triggers Dock migration at ~0.5-1.0 seconds,
+    /// but may count total bottom-edge time across display transitions.
+    /// 100ms is enough for cursor traversal between screens (~50ms typical)
+    /// while blocking Dock migration well before macOS triggers it.
+    private let dwellTimeout: CFAbsoluteTime = 0.1
 
     // MARK: - Accessibility Check
 
@@ -236,10 +256,29 @@ final class DockGuard: @unchecked Sendable {
 
     /// Called from the event tap callback (background thread).
     /// Returns the (possibly modified) event.
+    ///
+    /// # Dwell-based detection
+    ///
+    /// Instead of unconditionally blocking the bottom edge (which would break
+    /// multi-monitor cursor traversal and Universal Control), we track how
+    /// long the cursor has been sitting at the edge. The cursor passes through
+    /// freely for the first `dwellTimeout` (300ms). Only after that do we
+    /// start nudging it up to prevent Dock migration. This means:
+    ///
+    /// - Moving the cursor through the bottom edge to another monitor: works
+    /// - Universal Control handoff through the bottom edge: works
+    /// - Dwelling at the bottom edge (Dock migration trigger): blocked
+    ///
     fileprivate func handleMouseMoved(_ event: CGEvent) -> CGEvent {
-        let (enabled, preferredID, displays) = lock.withLock {
-            (_guardedEnabled, _guardedPreferredDisplayID, _guardedDisplayBounds)
-        }
+        let now = CFAbsoluteTimeGetCurrent()
+
+        lock.lock()
+        let enabled = _guardedEnabled
+        let preferredID = _guardedPreferredDisplayID
+        let displays = _guardedDisplayBounds
+        let dwellStart = _dwellStartTime
+        let dwellDisplay = _dwellDisplayID
+        lock.unlock()
 
         guard enabled, preferredID != 0, displays.count > 1 else {
             return event
@@ -248,34 +287,81 @@ final class DockGuard: @unchecked Sendable {
         let location = event.location  // CG coordinates: top-left origin
 
         // Determine which display the cursor is on.
+        // Note: CGRect.contains() uses half-open intervals [min, max), so a
+        // point at exactly maxX or maxY returns false. We must expand the
+        // check by 1px to catch the cursor sitting at the very bottom/right
+        // edge of a display — exactly where Dock migration triggers.
         var currentDisplayID: CGDirectDisplayID = 0
         var currentBounds: CGRect = .zero
 
         for display in displays {
-            if display.bounds.contains(location) {
+            let b = display.bounds
+            let inBounds = location.x >= b.minX && location.x <= b.maxX
+                        && location.y >= b.minY && location.y <= b.maxY
+            if inBounds {
                 currentDisplayID = display.id
-                currentBounds = display.bounds
+                currentBounds = b
                 break
             }
         }
 
-        // If cursor is on the preferred display, allow everything.
+        // If cursor is on the preferred display or unrecognized, allow and reset dwell.
         if currentDisplayID == preferredID || currentDisplayID == 0 {
+            if dwellStart != 0 {
+                lock.withLock {
+                    _dwellStartTime = 0
+                    _dwellDisplayID = 0
+                }
+            }
             return event
         }
 
         // Cursor is on a non-preferred display.
-        // Check if it's near the bottom edge (CG coords: bottom = maxY).
         let distanceFromBottom = currentBounds.maxY - location.y
+        let atBottomEdge = distanceFromBottom <= edgeThreshold
 
-        if distanceFromBottom <= edgeThreshold {
-            // Nudge the cursor up so it never dwells at the very bottom edge.
-            // This prevents macOS from triggering Dock migration.
-            var nudgedLocation = location
-            nudgedLocation.y = currentBounds.maxY - edgeThreshold - 1
-            event.location = nudgedLocation
+        if !atBottomEdge {
+            // Cursor moved away from the edge — reset dwell tracking.
+            if dwellStart != 0 {
+                lock.withLock {
+                    _dwellStartTime = 0
+                    _dwellDisplayID = 0
+                }
+            }
+            return event
         }
 
+        // Cursor IS at the bottom edge of a non-preferred display.
+
+        if dwellStart == 0 || dwellDisplay != currentDisplayID {
+            // Just entered the edge zone (or switched displays). Start tracking.
+            let displayForDwell = currentDisplayID
+            lock.withLock {
+                _dwellStartTime = now
+                _dwellDisplayID = displayForDwell
+            }
+            // Allow the event through — the cursor may be passing through.
+            return event
+        }
+
+        // Cursor has been at the edge for some time. Check duration.
+        let dwellDuration = now - dwellStart
+
+        if dwellDuration < dwellTimeout {
+            // Still within the grace period — allow the event through.
+            return event
+        }
+
+        // Dwell timeout exceeded — physically move the cursor away from the
+        // edge using CGWarpMouseCursorPosition. Simply modifying event.location
+        // is not enough: when the cursor is stationary, no mouseMoved events
+        // fire, and macOS's dock migration timer continues to see the cursor
+        // at the edge. CGWarp actually repositions the cursor at the OS level.
+        let nudgedY = currentBounds.maxY - edgeThreshold - 1
+        let nudgedPoint = CGPoint(x: location.x, y: nudgedY)
+        CGWarpMouseCursorPosition(nudgedPoint)
+        CGAssociateMouseAndMouseCursorPosition(1)
+        event.location = nudgedPoint
         return event
     }
 
